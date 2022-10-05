@@ -7,12 +7,19 @@ edition = "2021"
 incremental = true
 opt-level = 3
 strip = "symbols"
+panic = "abort"
+lto = "fat"
+
+[profile.release.package.frankenstein]
+opt-level = "s"
 
 [dependencies]
 anyhow = "1.0"
 
 # Telegram API
-frankenstein = { version = "0.20", default-features = false, features = ["async-http-client"] }
+frankenstein = { version = "0.20", default-features = false, features = [
+  "async-http-client",
+] }
 
 clap = { version = "4.0", features = ["derive", "cargo", "wrap_help", "env"] }
 clap-verbosity-flag = "2.0"
@@ -35,9 +42,11 @@ bytes = "1.2"
 xz2 = "0.1"
 tar = "0.4"
 
+tokio-stream = "0.1"
+
 [dependencies.reqwest]
 version = "0.11"
-features = ["json", "brotli", "gzip", "deflate", "socks", "multipart"]
+features = ["json", "brotli", "stream", "gzip", "deflate", "socks", "multipart"]
 
 [dependencies.tokio]
 version = "1.20"

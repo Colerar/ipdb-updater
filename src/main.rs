@@ -11,7 +11,7 @@ use chrono::Local;
 use clap::{ArgGroup, Parser, ValueHint};
 use clap_verbosity_flag::{LogLevel, Verbosity};
 use frankenstein::{AsyncApi, AsyncTelegramApi, SendDocumentParams};
-use log::{debug, error, info, LevelFilter};
+use log::{debug, error, info, warn, LevelFilter};
 use log4rs::{
   append::console::ConsoleAppender,
   config::{Appender, Root},
@@ -20,6 +20,7 @@ use log4rs::{
 };
 use reqwest::{Client, Proxy};
 use tokio::sync::Mutex;
+use tokio_stream::StreamExt;
 
 #[derive(Parser, Debug)]
 #[clap(group(
@@ -105,31 +106,14 @@ async fn main() -> Result<()> {
   };
 
   let today = format!("{}", Local::now().format("%Y%m%d"));
-  let dir = {
-    let mut path = output_dir.clone();
-    path.push(format!("./ipip-{today}"));
-    path
-  };
+  let dir = output_dir.join(format!("ipip-{today}"));
   fs::create_dir_all(&dir)
     .with_context(|| format!("Failed to create directory of {}", &dir.to_string_lossy()))?;
-  let tarxz_path = {
-    let mut path = output_dir.clone();
-    path.push(format!("./ipip-{today}.tar.xz"));
-    path
-  };
-  let ipv4 = {
-    let mut path = dir.clone();
-    path.push("./v4.ipdb");
-    path
-  };
-  let ipv6 = {
-    let mut path = dir.clone();
-    path.push("./v6.ipdb");
-    path
-  };
+  let tarxz_path = output_dir.join(format!("ipip-{today}.tar.xz"));
+  let ipv4 = dir.join("v4.ipdb");
+  let ipv6 = dir.join("v6.ipdb");
 
   let sha1sums = Arc::new(Mutex::new(Vec::new()));
-
   let download = |name: &'static str, path: PathBuf, token: String| {
     let sha1sums = Arc::clone(&sha1sums);
     async move {
@@ -141,20 +125,10 @@ async fn main() -> Result<()> {
           path.to_string_lossy()
         )
       );
-      let file = File::create(&path).with_context(|| {
-        format!(
-          "Failed to create {name} IPDB file at: {}",
-          path.to_string_lossy()
-        )
-      })?;
-      let mut buf_writer = BufWriter::new(file);
-      let (data, sha1) = fetch_ipdb(&cli, args.language, token)
+      let sha1 = fetch_ipdb(&cli, args.language, token, path.clone())
         .await
-        .context("Failed to download {name} IPDB")?;
+        .with_context(|| format!("Failed to download {} IPDB", name))?;
       info!("Writing to file: {}", path.to_string_lossy());
-      buf_writer
-        .write_all(&*data)
-        .with_context(|| format!("Failed to write data to file {}", path.to_string_lossy()))?;
       if let Some(sha1) = sha1 {
         info!("Checksum: {}", sha1);
         let mut sha1sums = sha1sums.lock().await;
@@ -166,6 +140,8 @@ async fn main() -> Result<()> {
             .into_owned(),
           sha1,
         ));
+      } else {
+        warn!("{} IPDB has no SHA-1 checksum", name);
       }
       Ok(())
     }
@@ -231,25 +207,40 @@ async fn fetch_ipdb(
   cli: &Client,
   language: Cow<'static, str>,
   token: String,
-) -> Result<(Vec<u8>, Option<String>)> {
+  path: PathBuf,
+) -> Result<Option<String>> {
   let resp = cli
     .get("https://user.ipip.net/download.php")
     .query(&[("type", "ipdb"), ("lang", &*language), ("token", &*token)])
     .send()
     .await
     .context("Failed to download IPDB")?;
+  ensure!(
+    resp.status().is_success(),
+    format!("Failed to download IPDB, status: {}", resp.status())
+  );
+
   let checksum = resp.headers().get("ETag").map(|etag| {
     String::from_utf8_lossy(etag.as_bytes())
       .chars()
       .skip(5)
       .collect::<String>()
   });
-  let vec = resp
-    .bytes()
-    .await
-    .context("Failed to get IPDB resp body as Bytes")?
-    .to_vec();
-  Ok((vec, checksum))
+
+  let mut stream = resp.bytes_stream();
+  let file = File::create(&path)
+    .with_context(|| format!("Failed to create file: {}", path.to_string_lossy()))?;
+  let mut buf_writer = BufWriter::new(file);
+  while let Some(chunk) = stream.next().await {
+    let chunk = chunk.context("Failed to load bytes chunk.")?;
+    buf_writer
+      .write_all(&chunk)
+      .with_context(|| format!("Failed to write data to: {}", path.to_string_lossy()))?;
+  }
+  buf_writer
+    .flush()
+    .with_context(|| format!("Failed to flush file to: {}", path.to_string_lossy()))?;
+  Ok(checksum)
 }
 
 #[cfg(debug_assertions)]
