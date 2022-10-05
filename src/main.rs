@@ -10,7 +10,7 @@ use anyhow::{ensure, Context, Result};
 use chrono::Local;
 use clap::{ArgGroup, Parser, ValueHint};
 use clap_verbosity_flag::{LogLevel, Verbosity};
-use frankenstein::{AsyncApi, AsyncTelegramApi, SendDocumentParams, SendMessageParams};
+use frankenstein::{AsyncApi, AsyncTelegramApi, SendDocumentParams};
 use log::{debug, error, info, LevelFilter};
 use log4rs::{
   append::console::ConsoleAppender,
@@ -67,6 +67,8 @@ async fn main() -> Result<()> {
     std::env::current_dir().expect("Failed to get current dir")
   };
 
+  info!("Output dir: {}", &output_dir.to_string_lossy());
+
   let mut cli = Client::builder();
   if let Some(proxy) = args.proxy {
     let proxy =
@@ -108,7 +110,8 @@ async fn main() -> Result<()> {
     path.push(format!("./ipip-{today}"));
     path
   };
-  fs::create_dir_all(&dir)?;
+  fs::create_dir_all(&dir)
+    .with_context(|| format!("Failed to create directory of {}", &dir.to_string_lossy()))?;
   let tarxz_path = {
     let mut path = output_dir.clone();
     path.push(format!("./ipip-{today}.tar.xz"));
@@ -122,7 +125,6 @@ async fn main() -> Result<()> {
   let ipv6 = {
     let mut path = dir.clone();
     path.push("./v6.ipdb");
-    path.canonicalize()?;
     path
   };
 
@@ -131,7 +133,7 @@ async fn main() -> Result<()> {
   let download = |name: &'static str, path: PathBuf, token: String| {
     let sha1sums = Arc::clone(&sha1sums);
     async move {
-      info!("Downloading {name} IPDB");
+      info!("Downloading {} IPDB", name);
       ensure!(
         !path.exists(),
         format!(
@@ -178,7 +180,7 @@ async fn main() -> Result<()> {
   let sha1sums = Arc::clone(&sha1sums);
   let sha1sums = &sha1sums.lock().await;
   let sha1sums = sha1sums.iter().fold(
-    "Sha1 checksums:".to_string(),
+    "SHA-1 Checksums:".to_string(),
     |acc, (filename, checksum)| format!("{acc}\n{filename}: {checksum}"),
   );
 
@@ -188,20 +190,21 @@ async fn main() -> Result<()> {
     return Ok(());
   };
 
-  info!("Compressing files...");
-
+  {
+    info!("Compressing files...");
     let tarxz = File::create(&tarxz_path).with_context(|| {
-    format!(
-      "Failed to create archive file: {}",
-      tarxz_path.to_string_lossy()
-    )
-  })?;
-  let enc = xz2::write::XzEncoder::new(tarxz, 6);
-  // let enc = write::GzEncoder::new(targz, Compression::best());
-  let mut tar = tar::Builder::new(enc);
-  tar
-    .append_dir_all(".", &dir)
-    .context("Failed to compress files...")?;
+      format!(
+        "Failed to create archive file: {}",
+        tarxz_path.to_string_lossy()
+      )
+    })?;
+    let enc = xz2::write::XzEncoder::new(tarxz, 6);
+    let mut tar = tar::Builder::new(enc);
+    tar
+      .append_dir_all(".", &dir)
+      .context("Failed to compress files...")?;
+    // RAII: tar.finish() here
+  }
 
   info!("Sending files to telegram...");
   let target_chat = args.target_chat.clone().unwrap();
@@ -210,19 +213,11 @@ async fn main() -> Result<()> {
       &SendDocumentParams::builder()
         .chat_id(target_chat.clone())
         .document(tarxz_path)
+        .caption(sha1sums)
         .build(),
     )
     .await
     .with_context(|| format!("Failed to send file to chat '{}'", &target_chat))?;
-  tg_api
-    .send_message(
-      &SendMessageParams::builder()
-        .chat_id(args.target_chat.clone().unwrap())
-        .text(sha1sums)
-        .build(),
-    )
-    .await
-    .with_context(|| format!("Failed to send message to chat '{}'", &target_chat))?;
 
   info!("Removing the source directory of archive...");
 
